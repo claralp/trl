@@ -21,13 +21,15 @@ from copy import deepcopy
 from functools import wraps
 from operator import itemgetter
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+import os
+from unittest.mock import patch
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate.utils import is_deepspeed_available, tqdm
-from datasets import Dataset, concatenate_datasets, interleave_datasets
+from datasets import Dataset, concatenate_datasets
 from torch.utils.data import DataLoader, SequentialSampler
 from transformers import (
     AutoModelForCausalLM,
@@ -62,7 +64,7 @@ if is_wandb_available():
 if is_deepspeed_available():
     import deepspeed
 
-
+@patch.dict(os.environ, {"WANDB_DISABLED": "true"})
 class KTOTrainer(Trainer):
     r"""
     Initialize KTOTrainer.
@@ -384,27 +386,17 @@ class KTOTrainer(Trainer):
                     UserWarning,
                 )
 
-        # split the dataset and interleave them together with equal probability of choosing chosen or rejected
-        interleaved_train_dataset = interleave_datasets(
-            [desirable, undesirable],
-            stopping_strategy="all_exhausted",
-        )
-        interleaved_train_dataset = interleaved_train_dataset.shuffle(seed=args.data_seed)
+        train_dataset = train_dataset.shuffle(seed=args.data_seed)
 
         if eval_dataset is not None:
-            interleaved_eval_dataset = interleave_datasets(
-                [eval_dataset.filter(lambda x: x["label"]), eval_dataset.filter(lambda x: not x["label"])],
-                stopping_strategy="all_exhausted",
-            )
-        else:
-            interleaved_eval_dataset = None
+            eval_dataset = eval_dataset.shuffle(seed=args.data_seed)
 
         super().__init__(
             model=model,
             args=args,
             data_collator=data_collator,
-            train_dataset=interleaved_train_dataset,
-            eval_dataset=interleaved_eval_dataset,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
             tokenizer=tokenizer,
             model_init=model_init,
             compute_metrics=compute_metrics,
@@ -927,6 +919,7 @@ class KTOTrainer(Trainer):
             0,
         )
 
+        print(losses.shape, chosen_rewards.shape, rejected_rewards.shape)
         return losses, chosen_rewards, rejected_rewards, kl
 
     def get_batch_loss_metrics(
@@ -984,13 +977,25 @@ class KTOTrainer(Trainer):
             reference_KL_logps,
         )
 
+        mean_chosen_reward = chosen_rewards.nanmean().detach()
+        mean_rejected_reward = rejected_rewards.nanmean().detach()
+        mean_chosen_logps = policy_chosen_logps.nanmean().detach()
+        mean_rejected_logps = policy_rejected_logps.nanmean().detach()
+
         prefix = "eval_" if train_eval == "eval" else ""
-        metrics[f"{prefix}rewards/chosen"] = chosen_rewards.detach().nanmean().cpu()
-        metrics[f"{prefix}rewards/rejected"] = rejected_rewards.detach().nanmean().cpu()
+        metrics[f"{prefix}rewards/chosen"] = self.accelerator.gather(mean_chosen_reward).nanmean().item()
+        metrics[f"{prefix}logps/chosen"] = self.accelerator.gather(mean_chosen_logps).nanmean().item()
+        metrics[f"{prefix}rewards/rejected"] = self.accelerator.gather(mean_rejected_reward).nanmean().item()
+        metrics[f"{prefix}logps/rejected"] = self.accelerator.gather(mean_rejected_logps).nanmean().item()
         metrics[f"{prefix}rewards/margins"] = metrics[f"{prefix}rewards/chosen"] - metrics[f"{prefix}rewards/rejected"]
-        metrics[f"{prefix}kl"] = kl.detach().cpu()  # is already the mean value within batch
-        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().nanmean().cpu()
-        metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.detach().nanmean().cpu()
+        metrics[f"{prefix}kl"] = kl.item()  # has already been gathered in kto_loss
+
+        #metrics[f"{prefix}rewards/chosen"] = chosen_rewards.detach().nanmean().cpu()
+        #metrics[f"{prefix}rewards/rejected"] = rejected_rewards.detach().nanmean().cpu()
+        #metrics[f"{prefix}rewards/margins"] = metrics[f"{prefix}rewards/chosen"] - metrics[f"{prefix}rewards/rejected"]
+        #metrics[f"{prefix}kl"] = kl.detach().cpu()  # is already the mean value within batch
+        #metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().nanmean().cpu()
+        #metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.detach().nanmean().cpu()
 
         return losses.nanmean(), metrics
 

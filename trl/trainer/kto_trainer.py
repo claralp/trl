@@ -984,6 +984,7 @@ class KTOTrainer(Trainer):
         metrics["kl"] = kl.detach().item()  # is already the mean value within batch
         metrics["logps/chosen"] = policy_chosen_logps.detach().tolist()
         metrics["logps/rejected"] = policy_rejected_logps.detach().tolist()
+        metrics["device"] = float(self.accelerator.process_index)
 
         if return_logits:
             return losses.nanmean(), metrics, logits
@@ -1102,7 +1103,6 @@ class KTOTrainer(Trainer):
                 loss, metrics = self.get_batch_loss_metrics(model, inputs)
             else:
                 loss, metrics, logits = self.get_batch_loss_metrics(model, inputs, return_logits=True)
-                print(logits.shape)
 
         # force log the metrics
         self.store_metrics(metrics, train_eval="eval")
@@ -1176,19 +1176,23 @@ class KTOTrainer(Trainer):
             logs (`Dict[str, float]`):
                 The values to log.
         """
-        # logs either has 'loss' or 'eval_loss'
-        train_eval = "train" if "loss" in logs else "eval"
-        # Add averaged stored metrics to logs
-        for key, metrics in self._stored_metrics[train_eval].items():
-            logs[f"{train_eval}/{key}"] = torch.tensor(metrics).nanmean().item()
+        self.accelerator.wait_for_everyone()
+        print(self._stored_metrics)
+        if self.accelerator.is_main_process:
+            # logs either has 'loss' or 'eval_loss'
+            train_eval = "train" if "loss" in logs else "eval"
+            # Add averaged stored metrics to logs
+            for key, metrics in self._stored_metrics[train_eval].items():
+                logs[f"{train_eval}/{key}"] = torch.tensor(metrics).nanmean().item()
 
-        # Add reward margin to log if rewards are available
-        if f"{train_eval}/rewards/chosen" in logs and f"{train_eval}/rewards/rejected" in logs:
-            logs[f"{train_eval}/rewards/margins"] = (
-                logs[f"{train_eval}/rewards/chosen"] - logs[f"{train_eval}/rewards/rejected"]
-            )
-        del self._stored_metrics[train_eval]
-        return super().log(logs)
+            # Add reward margin to log if rewards are available
+            if f"{train_eval}/rewards/chosen" in logs and f"{train_eval}/rewards/rejected" in logs:
+                logs[f"{train_eval}/rewards/margins"] = (
+                    logs[f"{train_eval}/rewards/chosen"] - logs[f"{train_eval}/rewards/rejected"]
+                )
+            del self._stored_metrics[train_eval]
+            print(logs)
+            return super().log(logs)
 
     @wraps(Trainer.push_to_hub)
     def push_to_hub(self, commit_message: Optional[str] = "End of training", blocking: bool = True, **kwargs) -> str:

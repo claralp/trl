@@ -1124,6 +1124,8 @@ class KTOTrainer(Trainer):
         )
         completion_logits = outputs.logits
 
+        print("logits", KL_logits.shape, completion_logits.shape)
+
         completion_logps = self.get_batch_logps(
             completion_logits,
             batch["completion_labels"],
@@ -1185,8 +1187,12 @@ class KTOTrainer(Trainer):
             The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
             The KL tensor contains the detached KL divergence estimate between the policy and reference models.
         """
+        print("logg logps", policy_KL_logps.shape, policy_chosen_logps.shape, policy_rejected_logps.shape)
+
         kl = (policy_KL_logps - reference_KL_logps).mean().detach()
-        kl = self.accelerator.gather(kl).mean().clamp(min=0)
+        kl = self.accelerator.gather(kl)
+        print("KL gathered", kl.shape)
+        kl = kl.mean().clamp(min=0)
 
         if policy_chosen_logps.shape[0] != 0 or reference_chosen_logps.shape[0] != 0:
             chosen_logratios = policy_chosen_logps - reference_chosen_logps

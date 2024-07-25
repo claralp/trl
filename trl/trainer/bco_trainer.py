@@ -684,12 +684,15 @@ class BCOTrainer(Trainer):
         nonzero = padded_prompt_embeddings.sum(dim=1) != 0
         prompt_embeddings = self.accelerator.gather(padded_prompt_embeddings)
 
+        print(f"prompt_embeddings {padded_prompt_embeddings}, all {prompt_embeddings}")
+
         # cannot predict for all empty values
         if prompt_embeddings.shape[0] == 0:
             return torch.tensor([], device=device, dtype=dtype)
 
         prob = self.clf.predict_proba(prompt_embeddings.cpu().float().numpy())[:, 1]
         prob = torch.as_tensor(prob, dtype=dtype, device=device)
+        print(f"all probs {prob}")
         prob = self.accelerator.reduce(prob, reduction="mean")
 
         prob = prob[sample_size * rank : sample_size * (rank + 1)]
@@ -1046,6 +1049,7 @@ class BCOTrainer(Trainer):
 
     def _get_udm_weight(self, rejected_embeddings: torch.FloatTensor) -> torch.FloatTensor:
         prob_desirable = self._get_chosen_prob(rejected_embeddings)
+        print(f"prob_desirable {prob_desirable}")
         min_ratio = self.args.min_density_ratio
         max_ratio = self.args.max_density_ratio
 
@@ -1108,7 +1112,7 @@ class BCOTrainer(Trainer):
         if self.match_underlying_distribution:
             chosen_weight = torch.ones_like(chosen_losses)
             rejected_weight = self._get_udm_weight(rejected_embeddings)
-
+            print(f"rejected {rejected_weight.shape} * {rejected_losses.shape}")
             losses = torch.cat((chosen_weight * chosen_losses, rejected_weight * rejected_losses), dim=0)
         else:
             losses = torch.cat((chosen_losses, rejected_losses), dim=0)

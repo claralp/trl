@@ -1048,14 +1048,7 @@ class BCOTrainer(Trainer):
 
     def _get_udm_weight(self, rejected_embeddings: torch.FloatTensor) -> torch.FloatTensor:
         prob_desirable = self._get_chosen_prob(rejected_embeddings)
-<<<<<<< HEAD
-<<<<<<< HEAD
 
-=======
-        print(f"prob_desirable {prob_desirable}")
->>>>>>> 683fc6a (debug)
-=======
->>>>>>> 6dc69ed (Update trl/trainer/bco_trainer.py)
         min_ratio = self.args.min_density_ratio
         max_ratio = self.args.max_density_ratio
 

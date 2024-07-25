@@ -588,7 +588,7 @@ class RunningMoments:
         new_var = tot_sum / tot_count
         self.std = (new_var * tot_count / (tot_count - 1)).float().sqrt().item()
         self.var = new_var.item()
-        self.count = tot_count
+        self.count = tot_count.item()
 
         return xs_mean.item(), (xs_var * xs_count / (xs_count - 1)).float().sqrt().item()
 
@@ -597,6 +597,7 @@ class RunningMoments:
         # save everything except accelerator
         if self.accelerator.is_main_process:
             save_dict = dataclasses.asdict(self, dict_factory=lambda x: {k: v for (k, v) in x if k != "accelerator"})
+            print(save_dict)
             json_string = json.dumps(save_dict, indent=2, sort_keys=True) + "\n"
             with open(json_path, "w", encoding="utf-8") as f:
                 f.write(json_string)

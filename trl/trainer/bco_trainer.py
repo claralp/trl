@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import joblib
 import os
 import random
 import textwrap
@@ -353,7 +354,7 @@ class BCOTrainer(Trainer):
         if type(args) is TrainingArguments:
             raise ValueError("Please use `BCOConfig` instead `TrainingArguments`.")
 
-        if not isinstance(model, str) and ref_model is model:
+        if not isinstance(model, str) and model is not None and ref_model is model:
             raise ValueError(
                 "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
                 "same as `model`, you must mass a copy of it, or `None` if you use peft."
@@ -599,10 +600,8 @@ class BCOTrainer(Trainer):
                     fn_kwargs={"tokenizer": processing_class},
                     num_proc=args.dataset_num_proc,
                 )
-            # Shuffle the datasets
-            train_dataset = train_dataset.shuffle(seed=args.data_seed)
-            if eval_dataset is not None:
-                eval_dataset = eval_dataset.shuffle(seed=args.data_seed)
+
+            print("before tokenization: " + train_dataset["prompt"][0])
             # Tokenize and prepare the training datasets
             train_dataset = train_dataset.map(
                 _tokenize,
@@ -664,9 +663,7 @@ class BCOTrainer(Trainer):
             undesirable = train_dataset.filter(
                 lambda x: not x["label"], num_proc=args.dataset_num_proc, desc="Filtering undesirable examples"
             )
-
-            desirable = desirable.shuffle(seed=args.data_seed)
-            undesirable = undesirable.shuffle(seed=args.data_seed)
+            print(f"desirable: {len(desirable)}, undesirable: {len(undesirable)}")
 
         super().__init__(
             model=model,
@@ -711,7 +708,7 @@ class BCOTrainer(Trainer):
 
         self.running = RunningMoments(accelerator=self.accelerator)
 
-        if self.embedding_func is None:
+        if self.embedding_func is None or args.resume_from_checkpoint:
             return
 
         chosen_embeddings = self._get_sample_prompt_embeddings(desirable, sample_size=self.args.prompt_sample_size)
@@ -725,6 +722,15 @@ class BCOTrainer(Trainer):
         self.clf = LogisticRegression(class_weight="balanced").fit(
             embeddings.cpu().float().numpy(), labels.cpu().numpy()
         )
+        chosen_mean = self.clf.score(
+            chosen_embeddings.cpu().float().numpy(),
+            torch.ones_like(chosen_embeddings[:, 0]).cpu().numpy()
+        )
+        rejected_mean = self.clf.score(
+            rejected_embeddings.cpu().float().numpy(),
+            torch.zeros_like(chosen_embeddings[:, 0]).cpu().numpy()
+        )
+        print(f"chosen_mean: {chosen_mean}, rejected_mean: {rejected_mean}")
 
     @property
     def match_underlying_distribution(self):
@@ -866,19 +872,20 @@ class BCOTrainer(Trainer):
     def _save_optimizer_and_scheduler(self, output_dir):
         super()._save_optimizer_and_scheduler(output_dir)
 
-        # When saving optimizer and scheduler to checkpoint, save also the running delta object.
-        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        if self.accelerator.is_main_process:
+            # When saving optimizer and scheduler to checkpoint, save also the running delta object.
+            self.running.save_to_json(os.path.join(output_dir, RUNNING_NAME))
 
-        self.running.save_to_json(os.path.join(output_dir, RUNNING_NAME))
-
-        if self.match_underlying_distribution:
-            torch.save(self.clf.get_params(), os.path.join(output_dir, CLF_NAME))
+            if self.match_underlying_distribution:
+                joblib.dump(self.clf, os.path.join(output_dir, CLF_NAME))
 
     def _load_optimizer_and_scheduler(self, checkpoint):
         super()._load_optimizer_and_scheduler(checkpoint)
 
         if checkpoint is None:
+            warnings.warn(f"Missing Checkpoint {checkpoint}")
             return
+        
         # when loading optimizer and scheduler from checkpoint, also load the running delta object.
         running_file = os.path.join(checkpoint, RUNNING_NAME)
         if os.path.isfile(running_file):
@@ -886,8 +893,8 @@ class BCOTrainer(Trainer):
 
         if self.match_underlying_distribution:
             clf_file = os.path.join(checkpoint, CLF_NAME)
-            if os.path.isfile(running_file):
-                self.clf.set_params(**torch.load(clf_file, weights_only=True, map_location="cpu"))
+            if os.path.isfile(clf_file):
+                self.clf = joblib.load(clf_file)
 
     @contextmanager
     def null_ref_context(self):
@@ -1130,6 +1137,7 @@ class BCOTrainer(Trainer):
         reference_rejected_logps: torch.FloatTensor,
         chosen_embeddings: Optional[torch.FloatTensor],
         rejected_embeddings: Optional[torch.FloatTensor],
+        do_train: bool = True,
     ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Compute the BCO loss for a batch of policy and reference model log probabilities.
 
@@ -1148,31 +1156,18 @@ class BCOTrainer(Trainer):
             The delta value contains the moving average of all implicit rewards.
         """
 
-        if policy_chosen_logps.shape[0] != 0 or reference_chosen_logps.shape[0] != 0:
-            chosen_logratios = policy_chosen_logps - reference_chosen_logps
-            chosen_rewards = self.beta * chosen_logratios
-        else:
-            # lists can't be empty -- if they are, then accelerate.gather will hang
-            chosen_losses = torch.Tensor([]).to(self.accelerator.device)
-            chosen_rewards = torch.Tensor([]).to(self.accelerator.device)
+        chosen_logratios = policy_chosen_logps - reference_chosen_logps
+        chosen_rewards = self.beta * chosen_logratios
 
-        if policy_rejected_logps.shape[0] != 0 or reference_rejected_logps.shape[0] != 0:
-            rejected_logratios = policy_rejected_logps - reference_rejected_logps
-            rejected_rewards = self.beta * rejected_logratios
-        else:
-            # lists can't be empty -- if they are, then accelerate.gather will hang
-            rejected_losses = torch.Tensor([]).to(self.accelerator.device)
-            rejected_rewards = torch.Tensor([]).to(self.accelerator.device)
+        rejected_logratios = policy_rejected_logps - reference_rejected_logps
+        rejected_rewards = self.beta * rejected_logratios
+        
+        if do_train:
+            self.running.update(torch.cat((chosen_rewards, rejected_rewards), 0).detach())
+        delta = torch.as_tensor(self.running.mean, device=chosen_rewards.device)
 
-        rewards = torch.cat((chosen_rewards, rejected_rewards), 0).mean().detach()
-        self.running.update(rewards)
-        delta = self.running.mean
-
-        if policy_chosen_logps.shape[0] != 0 or reference_chosen_logps.shape[0] != 0:
-            chosen_losses = -F.logsigmoid(chosen_rewards - delta)
-
-        if policy_rejected_logps.shape[0] != 0 or reference_rejected_logps.shape[0] != 0:
-            rejected_losses = -F.logsigmoid(-(rejected_rewards - delta))
+        chosen_losses = -F.logsigmoid(chosen_rewards - delta)
+        rejected_losses = -F.logsigmoid(-(rejected_rewards - delta))
 
         if self.match_underlying_distribution:
             chosen_weight = torch.ones_like(chosen_losses)
@@ -1182,12 +1177,13 @@ class BCOTrainer(Trainer):
         else:
             losses = torch.cat((chosen_losses, rejected_losses), dim=0)
 
-        return losses, chosen_rewards, rejected_rewards, torch.as_tensor(delta)
+        return losses, chosen_rewards, rejected_rewards, delta
 
     def get_batch_loss_metrics(
         self,
         model,
         batch: dict[str, Union[list, torch.LongTensor]],
+        do_train: bool = True,
     ):
         """Compute the BCO loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
@@ -1237,6 +1233,7 @@ class BCOTrainer(Trainer):
             reference_rejected_logps,
             chosen_embeddings,
             rejected_embeddings,
+            do_train=do_train,
         )
         metrics["delta"] = self.accelerator.gather_for_metrics(delta).mean().item()
 
@@ -1367,7 +1364,7 @@ class BCOTrainer(Trainer):
 
         prediction_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
         with torch.no_grad(), prediction_context_manager:
-            loss, metrics = self.get_batch_loss_metrics(model, inputs)
+            loss, metrics = self.get_batch_loss_metrics(model, inputs, do_train=False)
 
         # force log the metrics
         if self.accelerator.is_main_process:

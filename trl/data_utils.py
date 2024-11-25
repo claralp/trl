@@ -84,6 +84,8 @@ def apply_chat_template(
     ]:
         raise KeyError(f"Invalid keys in the example: {example_keys}")
 
+    print(f"applying chat template to keys: {example_keys}")
+
     # Apply the chat template to the whole conversation
     if "messages" in example:
         messages = tokenizer.apply_chat_template(example["messages"], tools=tools, tokenize=False)

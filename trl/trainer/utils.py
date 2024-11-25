@@ -711,6 +711,7 @@ class RunningMoments:
             xs_count = xs.numel()
             xs_var, xs_mean = torch.var_mean(xs, unbiased=False)
         xs_mean, xs_var = xs_mean.float(), xs_var.float()
+        print(f"{self.accelerator.process_index}: xs {xs}, mean {xs_mean}, var {xs_var}, cnt {xs_count}\n")
 
         delta = xs_mean - self.mean
         tot_count = self.count + xs_count
@@ -725,6 +726,9 @@ class RunningMoments:
         self.std = (new_var * tot_count / (tot_count - 1)).float().sqrt().item()
         self.var = new_var.item()
         self.count = tot_count
+
+        self.accelerator.wait_for_everyone()
+        print(f"{self.accelerator.process_index} updated: mean {self.mean}, std {self.std}, var {self.var}, cnt {self.count}\n")
 
         return xs_mean.item(), (xs_var * xs_count / (xs_count - 1)).float().sqrt().item()
 

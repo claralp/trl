@@ -863,19 +863,20 @@ class BCOTrainer(Trainer):
     def _save_optimizer_and_scheduler(self, output_dir):
         super()._save_optimizer_and_scheduler(output_dir)
 
-        # When saving optimizer and scheduler to checkpoint, save also the running delta object.
-        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        if self.accelerator.is_main_process:
+            # When saving optimizer and scheduler to checkpoint, save also the running delta object.
+            self.running.save_to_json(os.path.join(output_dir, RUNNING_NAME))
 
-        self.running.save_to_json(os.path.join(output_dir, RUNNING_NAME))
-
-        if self.match_underlying_distribution:
-            torch.save(self.clf.get_params(), os.path.join(output_dir, CLF_NAME))
+            if self.match_underlying_distribution:
+                torch.save(self.clf.get_params(), os.path.join(output_dir, CLF_NAME))
 
     def _load_optimizer_and_scheduler(self, checkpoint):
         super()._load_optimizer_and_scheduler(checkpoint)
 
         if checkpoint is None:
+            warnings.warn(f"Missing Checkpoint {checkpoint}")
             return
+        
         # when loading optimizer and scheduler from checkpoint, also load the running delta object.
         running_file = os.path.join(checkpoint, RUNNING_NAME)
         if os.path.isfile(running_file):
@@ -1116,6 +1117,7 @@ class BCOTrainer(Trainer):
         max_ratio = self.args.max_density_ratio
 
         weight = (prob_desirable / (1 - prob_desirable + 1e-8)).clamp(min=min_ratio, max=max_ratio)
+        print(f"{self.accelerator.process_index}: prob_desirable {prob_desirable}, weight {weight}\n")
 
         return weight
 
@@ -1145,31 +1147,17 @@ class BCOTrainer(Trainer):
             The delta value contains the moving average of all implicit rewards.
         """
 
-        if policy_chosen_logps.shape[0] != 0 or reference_chosen_logps.shape[0] != 0:
-            chosen_logratios = policy_chosen_logps - reference_chosen_logps
-            chosen_rewards = self.beta * chosen_logratios
-        else:
-            # lists can't be empty -- if they are, then accelerate.gather will hang
-            chosen_losses = torch.Tensor([]).to(self.accelerator.device)
-            chosen_rewards = torch.Tensor([]).to(self.accelerator.device)
+        chosen_logratios = policy_chosen_logps - reference_chosen_logps
+        chosen_rewards = self.beta * chosen_logratios
 
-        if policy_rejected_logps.shape[0] != 0 or reference_rejected_logps.shape[0] != 0:
-            rejected_logratios = policy_rejected_logps - reference_rejected_logps
-            rejected_rewards = self.beta * rejected_logratios
-        else:
-            # lists can't be empty -- if they are, then accelerate.gather will hang
-            rejected_losses = torch.Tensor([]).to(self.accelerator.device)
-            rejected_rewards = torch.Tensor([]).to(self.accelerator.device)
-
-        rewards = torch.cat((chosen_rewards, rejected_rewards), 0).mean().detach()
-        self.running.update(rewards)
+        rejected_logratios = policy_rejected_logps - reference_rejected_logps
+        rejected_rewards = self.beta * rejected_logratios
+        
+        self.running.update(torch.cat((chosen_rewards, rejected_rewards), 0).detach())
         delta = self.running.mean
 
-        if policy_chosen_logps.shape[0] != 0 or reference_chosen_logps.shape[0] != 0:
-            chosen_losses = -F.logsigmoid(chosen_rewards - delta)
-
-        if policy_rejected_logps.shape[0] != 0 or reference_rejected_logps.shape[0] != 0:
-            rejected_losses = -F.logsigmoid(-(rejected_rewards - delta))
+        chosen_losses = -F.logsigmoid(chosen_rewards - delta)
+        rejected_losses = -F.logsigmoid(-(rejected_rewards - delta))
 
         if self.match_underlying_distribution:
             chosen_weight = torch.ones_like(chosen_losses)

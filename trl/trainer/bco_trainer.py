@@ -50,7 +50,7 @@ from transformers import (
     is_wandb_available,
 )
 from transformers.trainer_callback import TrainerCallback
-from transformers.trainer_utils import EvalLoopOutput, has_length
+from transformers.trainer_utils import EvalLoopOutput, has_length, number_of_arguments
 from transformers.utils import is_peft_available
 
 from ..data_utils import maybe_apply_chat_template
@@ -304,6 +304,8 @@ class BCOTrainer(Trainer):
             which will pad the sequences to the maximum length of the sequences in the batch, given a dataset of paired sequences.
         model_init (`Callable[[], transformers.PreTrainedModel]`):
             The model initializer to use for training. If None is specified, the default model initializer will be used.
+        ref_model_init (`Callable[[], transformers.PreTrainedModel]`):
+            The model initializer to use for the reference model.
         callbacks (`list[transformers.TrainerCallback]`):
             The callbacks to use for training.
         optimizers (`tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]`):
@@ -335,6 +337,7 @@ class BCOTrainer(Trainer):
         ] = None,
         data_collator: Optional[DataCollator] = None,
         model_init: Optional[Callable[[], PreTrainedModel]] = None,
+        ref_model_init: Optional[Callable[[], PreTrainedModel]] = None,
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
@@ -352,137 +355,8 @@ class BCOTrainer(Trainer):
 
         if type(args) is TrainingArguments:
             raise ValueError("Please use `BCOConfig` instead `TrainingArguments`.")
-
-        if not isinstance(model, str) and ref_model is model:
-            raise ValueError(
-                "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
-                "same as `model`, you must mass a copy of it, or `None` if you use peft."
-            )
-
-        if args.model_init_kwargs is None:
-            model_init_kwargs = {}
-        elif not isinstance(model, str):
-            raise ValueError("You passed model_kwargs to the BCOTrainer. But your model is already instantiated.")
-        else:
-            model_init_kwargs = args.model_init_kwargs
-            torch_dtype = model_init_kwargs.get("torch_dtype")
-            if torch_dtype is not None:
-                # Convert to `torch.dtype` if an str is passed
-                if isinstance(torch_dtype, str) and torch_dtype != "auto":
-                    torch_dtype = getattr(torch, torch_dtype)
-                if torch_dtype != "auto" and not isinstance(torch_dtype, torch.dtype):
-                    raise ValueError(
-                        f"Invalid `torch_dtype` passed to the BCOConfig. Expected a string with either `torch.dtype` or 'auto', but got {torch_dtype}."
-                    )
-                model_init_kwargs["torch_dtype"] = torch_dtype
-
-        if args.ref_model_init_kwargs is None:
-            ref_model_init_kwargs = {}
-        elif not isinstance(ref_model, str):
-            raise ValueError(
-                "You passed ref_model_kwargs to the BCOTrainer. But your ref_model is already instantiated."
-            )
-        else:
-            ref_model_init_kwargs = args.ref_model_init_kwargs
-            torch_dtype = ref_model_init_kwargs.get("torch_dtype")
-            if torch_dtype is not None:
-                # Convert to `torch.dtype` if an str is passed
-                if isinstance(torch_dtype, str) and torch_dtype != "auto":
-                    torch_dtype = getattr(torch, torch_dtype)
-                if torch_dtype != "auto" and not isinstance(torch_dtype, torch.dtype):
-                    raise ValueError(
-                        f"Invalid `torch_dtype` passed to the BCOConfig. Expected a string with either `torch.dtype` or 'auto', but got {torch_dtype}."
-                    )
-                ref_model_init_kwargs["torch_dtype"] = torch_dtype
-
-        if isinstance(model, str):
-            model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
-
-        if isinstance(ref_model, str):
-            ref_model = AutoModelForCausalLM.from_pretrained(ref_model, **ref_model_init_kwargs)
-
-        # Initialize this variable to False. This helps tracking the case when `peft_module_casting_to_bf16`
-        # has been called in order to properly call autocast if needed.
-        self._peft_has_been_casted_to_bf16 = False
-
-        if not is_peft_available() and peft_config is not None:
-            raise ValueError(
-                "PEFT is not installed and you passed a `peft_config` in the trainer's kwargs, please install it with `pip install peft` to use the PEFT models"
-            )
-        elif is_peft_available() and peft_config is not None:
-            # if model is a peft model and we have a peft_config, we merge and unload it first
-            if isinstance(model, PeftModel):
-                model = model.merge_and_unload()
-
-            if getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False):
-                _support_gc_kwargs = hasattr(
-                    args, "gradient_checkpointing_kwargs"
-                ) and "gradient_checkpointing_kwargs" in list(
-                    inspect.signature(prepare_model_for_kbit_training).parameters
-                )
-
-                prepare_model_kwargs = {"use_gradient_checkpointing": args.gradient_checkpointing}
-
-                if _support_gc_kwargs:
-                    prepare_model_kwargs["gradient_checkpointing_kwargs"] = args.gradient_checkpointing_kwargs
-
-                model = prepare_model_for_kbit_training(model, **prepare_model_kwargs)
-            elif getattr(args, "gradient_checkpointing", False):
-                # For backward compatibility with older versions of transformers
-                if hasattr(model, "enable_input_require_grads"):
-                    model.enable_input_require_grads()
-                else:
-
-                    def make_inputs_require_grad(module, input, output):
-                        output.requires_grad_(True)
-
-                    model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-
-            # get peft model with the given config
-            model = get_peft_model(model, peft_config)
-            if args.bf16 and getattr(model, "is_loaded_in_4bit", False):
-                peft_module_casting_to_bf16(model)
-                # If args.bf16 we need to explicitly call `generate` with torch amp autocast context manager
-                self._peft_has_been_casted_to_bf16 = True
-
-        # For models that use gradient_checkpointing, we need to attach a hook that enables input
-        # to explicitly have `requires_grad=True`, otherwise training will either silently
-        # fail or completely fail.
-        elif getattr(args, "gradient_checkpointing", False):
-            # For backward compatibility with older versions of transformers
-            if hasattr(model, "enable_input_require_grads"):
-                model.enable_input_require_grads()
-            else:
-
-                def make_inputs_require_grad(module, input, output):
-                    output.requires_grad_(True)
-
-                model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-
-        if args.generate_during_eval and not (is_wandb_available() or is_comet_available()):
-            raise ValueError(
-                "`generate_during_eval=True` requires Weights and Biases or Comet to be installed."
-                " Please install `wandb` or `comet-ml` to resolve."
-            )
-
-        if model is not None:
-            self.is_encoder_decoder = model.config.is_encoder_decoder
-        elif args.is_encoder_decoder is None:
-            raise ValueError("When no model is provided, you need to pass the parameter is_encoder_decoder.")
-        else:
-            self.is_encoder_decoder = args.is_encoder_decoder
-
-        self.is_peft_model = is_peft_available() and isinstance(model, PeftModel)
-        self.model_adapter_name = model_adapter_name
-        self.ref_adapter_name = ref_adapter_name
-
-        if ref_model:
-            self.ref_model = ref_model
-        elif self.is_peft_model or args.precompute_ref_log_probs:
-            # The `model` with adapters turned off will be used as the reference model
-            self.ref_model = None
-        else:
-            self.ref_model = create_reference_model(model)
+        
+        self.ref_model_init = ref_model_init
 
         if processing_class is None:
             raise ValueError(
@@ -508,6 +382,13 @@ class BCOTrainer(Trainer):
         if args.max_prompt_length is not None:
             max_prompt_length = args.max_prompt_length
 
+        if model is not None:
+            self.is_encoder_decoder = model.config.is_encoder_decoder
+        elif args.is_encoder_decoder is None:
+            raise ValueError("When no model is provided, you need to pass the parameter is_encoder_decoder.")
+        else:
+            self.is_encoder_decoder = args.is_encoder_decoder
+
         max_completion_length = None
         if args.max_completion_length is None and self.is_encoder_decoder:
             warnings.warn(
@@ -517,7 +398,21 @@ class BCOTrainer(Trainer):
             )
             max_completion_length = 128
         if args.max_completion_length is not None and self.is_encoder_decoder:
-            max_completion_length = args.max_completion_length
+            max_completion_length = args.max_completion_length 
+
+        # Data preprocessing arguments
+        self.max_length = max_length
+        self.generate_during_eval = args.generate_during_eval
+        self.label_pad_token_id = args.label_pad_token_id
+        self.padding_value = args.padding_value if args.padding_value is not None else processing_class.pad_token_id
+        self.max_prompt_length = max_prompt_length
+        self.truncation_mode = args.truncation_mode
+        self.max_completion_length = max_completion_length
+        self.precompute_ref_log_probs = args.precompute_ref_log_probs
+
+        # Underlying Distribution Matching argument
+        self.embedding_func = embedding_func
+        self.embedding_tokenizer = embedding_tokenizer
 
         if data_collator is None:
             data_collator = DPODataCollatorWithPadding(
@@ -538,55 +433,6 @@ class BCOTrainer(Trainer):
             self.use_dpo_data_collator = True
         else:
             self.use_dpo_data_collator = False
-
-        # Disable dropout in the model and reference model
-        if args.disable_dropout:
-            disable_dropout_in_model(model)
-            if self.ref_model is not None:
-                disable_dropout_in_model(self.ref_model)
-
-        self.max_length = max_length
-        self.generate_during_eval = args.generate_during_eval
-        self.label_pad_token_id = args.label_pad_token_id
-        self.padding_value = args.padding_value if args.padding_value is not None else processing_class.pad_token_id
-        self.max_prompt_length = max_prompt_length
-        self.truncation_mode = args.truncation_mode
-        self.max_completion_length = max_completion_length
-        self.precompute_ref_log_probs = args.precompute_ref_log_probs
-
-        # Since ref_logs are precomputed on the first call to get_train/eval_dataloader
-        # keep track of first called to avoid computation of future calls
-        self._precomputed_train_ref_log_probs = False
-        self._precomputed_eval_ref_log_probs = False
-
-        # metric
-        self._stored_metrics = defaultdict(lambda: defaultdict(list))
-
-        # BCO parameter
-        self.beta = args.beta
-        self.aux_loss_enabled = getattr(model.config, "output_router_logits", False)
-        self.aux_loss_coef = getattr(model.config, "router_aux_loss_coef", 0.0)
-        if self.aux_loss_enabled and self.aux_loss_coef == 0.0:
-            warnings.warn(
-                "You set `output_router_logits` to `True` in the model config, but `router_aux_loss_coef` is set to "
-                "`0.0`, meaning the auxiliary loss will not be used. Either set `router_aux_loss_coef` to a value "
-                "greater than `0.0`, or set `output_router_logits` to `False` if you don't want to use the auxiliary "
-                "loss.",
-                UserWarning,
-            )
-
-        # Underlying Distribution Matching argument
-        self.embedding_func = embedding_func
-        self.embedding_tokenizer = embedding_tokenizer
-
-        # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
-        # input tensor associated with the key "input_ids". However, in BCO, the sampled data does not include the
-        # "input_ids" key. Instead, the available keys are "prompt_input_ids" and "completion_input_ids". As a result,
-        # the trainer issues the warning: "Could not estimate the number of tokens of the input, floating-point
-        # operations will not be computed." To suppress this warning, we set the "estimate_tokens" key in the model's
-        # "warnings_issued" dictionary to True. This acts as a flag to indicate that the warning has already been
-        # issued.
-        model.warnings_issued["estimate_tokens"] = True
 
         with PartialState().local_main_process_first():
             # Apply the chat template if needed
@@ -658,16 +504,6 @@ class BCOTrainer(Trainer):
                     desc="Processing tokenized eval dataset",
                 )
 
-            desirable = train_dataset.filter(
-                lambda x: x["label"], num_proc=args.dataset_num_proc, desc="Filtering desirable examples"
-            )
-            undesirable = train_dataset.filter(
-                lambda x: not x["label"], num_proc=args.dataset_num_proc, desc="Filtering undesirable examples"
-            )
-
-            desirable = desirable.shuffle(seed=args.data_seed)
-            undesirable = undesirable.shuffle(seed=args.data_seed)
-
         super().__init__(
             model=model,
             args=args,
@@ -681,6 +517,134 @@ class BCOTrainer(Trainer):
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         )
+
+        if not isinstance(model, str) and model is not None and ref_model is model:
+            raise ValueError(
+                "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
+                "same as `model`, you must mass a copy of it, or `None` if you use peft."
+            )
+
+        # Initialize this variable to False. This helps tracking the case when `peft_module_casting_to_bf16`
+        # has been called in order to properly call autocast if needed.
+        self._peft_has_been_casted_to_bf16 = False
+
+        if not is_peft_available() and peft_config is not None:
+            raise ValueError(
+                "PEFT is not installed and you passed a `peft_config` in the trainer's kwargs, please install it with `pip install peft` to use the PEFT models"
+            )
+        elif is_peft_available() and peft_config is not None:
+            # if model is a peft model and we have a peft_config, we merge and unload it first
+            if isinstance(self.model, PeftModel):
+                self.model = self.model.merge_and_unload()
+
+            if getattr(self.model, "is_loaded_in_8bit", False) or getattr(self.model, "is_loaded_in_4bit", False):
+                _support_gc_kwargs = hasattr(
+                    args, "gradient_checkpointing_kwargs"
+                ) and "gradient_checkpointing_kwargs" in list(
+                    inspect.signature(prepare_model_for_kbit_training).parameters
+                )
+
+                prepare_model_kwargs = {"use_gradient_checkpointing": args.gradient_checkpointing}
+
+                if _support_gc_kwargs:
+                    prepare_model_kwargs["gradient_checkpointing_kwargs"] = args.gradient_checkpointing_kwargs
+
+                self.model = prepare_model_for_kbit_training(self.model, **prepare_model_kwargs)
+            elif getattr(args, "gradient_checkpointing", False):
+                # For backward compatibility with older versions of transformers
+                if hasattr(self.model, "enable_input_require_grads"):
+                    self.model.enable_input_require_grads()
+                else:
+
+                    def make_inputs_require_grad(module, input, output):
+                        output.requires_grad_(True)
+
+                    self.model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+            # get peft model with the given config
+            self.model = get_peft_model(self.model, peft_config)
+            if args.bf16 and getattr(self.model, "is_loaded_in_4bit", False):
+                peft_module_casting_to_bf16(self.model)
+                # If args.bf16 we need to explicitly call `generate` with torch amp autocast context manager
+                self._peft_has_been_casted_to_bf16 = True
+
+        # For models that use gradient_checkpointing, we need to attach a hook that enables input
+        # to explicitly have `requires_grad=True`, otherwise training will either silently
+        # fail or completely fail.
+        elif getattr(args, "gradient_checkpointing", False):
+            # For backward compatibility with older versions of transformers
+            if hasattr(self.model, "enable_input_require_grads"):
+                self.model.enable_input_require_grads()
+            else:
+
+                def make_inputs_require_grad(module, input, output):
+                    output.requires_grad_(True)
+
+                self.model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+        if args.generate_during_eval and not (is_wandb_available() or is_comet_available()):
+            raise ValueError(
+                "`generate_during_eval=True` requires Weights and Biases or Comet to be installed."
+                " Please install `wandb` or `comet-ml` to resolve."
+            )        
+
+        self.is_peft_model = is_peft_available() and isinstance(self.model, PeftModel)
+        self.model_adapter_name = model_adapter_name
+        self.ref_adapter_name = ref_adapter_name
+
+        if ref_model:
+            self.ref_model = ref_model
+        elif self.is_peft_model or args.precompute_ref_log_probs:
+            # The `model` with adapters turned off will be used as the reference model
+            self.ref_model = None
+        else:
+            self.ref_model = create_reference_model(model)       
+
+        # Disable dropout in the model and reference model
+        if args.disable_dropout:
+            disable_dropout_in_model(self.model)
+            if self.ref_model is not None:
+                disable_dropout_in_model(self.ref_model)
+
+        # Since ref_logs are precomputed on the first call to get_train/eval_dataloader
+        # keep track of first called to avoid computation of future calls
+        self._precomputed_train_ref_log_probs = False
+        self._precomputed_eval_ref_log_probs = False
+
+        # metric
+        self._stored_metrics = defaultdict(lambda: defaultdict(list))
+
+        # BCO parameter
+        self.beta = args.beta
+        self.aux_loss_enabled = getattr(self.model.config, "output_router_logits", False)
+        self.aux_loss_coef = getattr(self.model.config, "router_aux_loss_coef", 0.0)
+        if self.aux_loss_enabled and self.aux_loss_coef == 0.0:
+            warnings.warn(
+                "You set `output_router_logits` to `True` in the model config, but `router_aux_loss_coef` is set to "
+                "`0.0`, meaning the auxiliary loss will not be used. Either set `router_aux_loss_coef` to a value "
+                "greater than `0.0`, or set `output_router_logits` to `False` if you don't want to use the auxiliary "
+                "loss.",
+                UserWarning,
+            )        
+
+        # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
+        # input tensor associated with the key "input_ids". However, in BCO, the sampled data does not include the
+        # "input_ids" key. Instead, the available keys are "prompt_input_ids" and "completion_input_ids". As a result,
+        # the trainer issues the warning: "Could not estimate the number of tokens of the input, floating-point
+        # operations will not be computed." To suppress this warning, we set the "estimate_tokens" key in the model's
+        # "warnings_issued" dictionary to True. This acts as a flag to indicate that the warning has already been
+        # issued.
+        self.model.warnings_issued["estimate_tokens"] = True
+
+        with PartialState().local_main_process_first():
+
+            desirable = train_dataset.filter(
+                lambda x: x["label"], num_proc=args.dataset_num_proc, desc="Filtering desirable examples"
+            )
+            undesirable = train_dataset.filter(
+                lambda x: not x["label"], num_proc=args.dataset_num_proc, desc="Filtering undesirable examples"
+            )
+            print(f"desirable: {len(desirable)}, undesirable: {len(undesirable)}")
 
         # Add tags for models that have been loaded with the correct transformers version
         if hasattr(self.model, "add_model_tags"):
@@ -729,6 +693,25 @@ class BCOTrainer(Trainer):
     @property
     def match_underlying_distribution(self):
         return self.embedding_func is not None and self.embedding_tokenizer is not None
+    
+    def call_model_init(self, trial=None):
+        model = super().call_model_init(trial)
+
+        if self.ref_model_init is not None:
+            model_init_argcount = number_of_arguments(self.ref_model_init)
+            if model_init_argcount == 0:
+                ref_model = self.ref_model_init()
+            elif model_init_argcount == 1:
+                ref_model = self.ref_model_init(trial)
+            else:
+                raise RuntimeError("ref_model_init should have 0 or 1 argument.")
+
+            if ref_model is None:
+                raise RuntimeError("ref_model_init should not return None.")
+            
+            self.ref_model = ref_model
+
+        return model
 
     def _get_chosen_prob(self, prompt_embeddings: torch.FloatTensor) -> torch.FloatTensor:
         """
